@@ -1,135 +1,258 @@
-var redis = require('redis');
-var async = require('async');
+import stats from './stats.js';
 
-var stats = require('./stats.js');
+export default class PoolAPI {
+    constructor(logger, portalConfig, poolConfigs) {
+        this.logger = logger;
+        this.portalConfig = portalConfig;
+        this.poolConfigs = poolConfigs;
+        this.portalStats = new stats(logger, portalConfig, poolConfigs);
+        this.liveStatConnections = new Map();
+    }
 
-module.exports = function(logger, portalConfig, poolConfigs){
+    async handleApiRequest(req, res, next) {
+        const { method } = req.params;
 
-    var _this = this;
-
-    var portalStats = this.stats = new stats(logger, portalConfig, poolConfigs);
-
-    this.liveStatConnections = {};
-
-    this.handleApiRequest = function(req, res, next){
-
-        switch(req.params.method){
+        switch (method) {
             case 'stats':
-                res.header('Content-Type', 'application/json');
-                res.end(portalStats.statsString);
+                this.sendJsonResponse(res, this.portalStats.statsString);
                 return;
+
             case 'pool_stats':
-                res.header('Content-Type', 'application/json');
-                res.end(JSON.stringify(portalStats.statPoolHistory));
+                this.sendJsonResponse(res, JSON.stringify(this.portalStats.statPoolHistory));
                 return;
+
             case 'blocks':
             case 'getblocksstats':
-                portalStats.getBlocks(function(data){
-                    res.header('Content-Type', 'application/json');
-                    res.end(JSON.stringify(data));                                        
-                });
-                break;
-            case 'payments':
-                var poolBlocks = [];
-                for(var pool in portalStats.stats.pools) {
-                    poolBlocks.push({name: pool, pending: portalStats.stats.pools[pool].pending, payments: portalStats.stats.pools[pool].payments});
+                try {
+                    const data = await this.getBlocksData();
+                    this.sendJsonResponse(res, JSON.stringify(data));
+                } catch (error) {
+                    this.sendErrorResponse(res, error);
                 }
-                res.header('Content-Type', 'application/json');
-                res.end(JSON.stringify(poolBlocks));
                 return;
-			case 'worker_stats':
-				res.header('Content-Type', 'application/json');
-				if (req.url.indexOf("?")>0) {
-				var url_parms = req.url.split("?");
-				if (url_parms.length > 0) {
-					var history = {};
-					var workers = {};
-					var address = url_parms[1] || null;
-					//res.end(portalStats.getWorkerStats(address));
-					if (address != null && address.length > 0) {
-						// make sure it is just the miners address
-						address = address.split(".")[0];
-						// get miners balance along with worker balances
-						portalStats.getBalanceByAddress(address, function(balances) {
-							// get current round share total
-							portalStats.getTotalSharesByAddress(address, function(shares) {								
-								var totalHash = parseFloat(0.0);
-								var totalShares = shares;
-								var networkSols = 0;
-								for (var h in portalStats.statHistory) {
-									for(var pool in portalStats.statHistory[h].pools) {
-										for(var w in portalStats.statHistory[h].pools[pool].workers){
-											if (w.startsWith(address)) {
-												if (history[w] == null) {
-													history[w] = [];
-												}
-												if (portalStats.statHistory[h].pools[pool].workers[w].hashrate) {
-													history[w].push({time: portalStats.statHistory[h].time, hashrate:portalStats.statHistory[h].pools[pool].workers[w].hashrate});
-												}
-											}
-										}
-										// order check...
-										//console.log(portalStats.statHistory[h].time);
-									}
-								}
-								for(var pool in portalStats.stats.pools) {
-								  for(var w in portalStats.stats.pools[pool].workers){
-									  if (w.startsWith(address)) {
-										workers[w] = portalStats.stats.pools[pool].workers[w];
-										for (var b in balances.balances) {
-											if (w == balances.balances[b].worker) {
-                                                workers[w].paid = balances.balances[b].paid;
-                                                workers[w].balance = balances.balances[b].balance;
-											}
-										}
-										workers[w].balance = (workers[w].balance || 0);
-										workers[w].paid = (workers[w].paid || 0);
-										totalHash += portalStats.stats.pools[pool].workers[w].hashrate;
-										networkSols = portalStats.stats.pools[pool].poolStats.networkSols;
-									  }
-								  }
-								}
-								res.end(JSON.stringify({miner: address, totalHash: totalHash, totalShares: totalShares, networkSols: networkSols, immature: balances.totalImmature, balance: balances.totalHeld, paid: balances.totalPaid, workers: workers, history: history}));
-							});
-						});
-					} else {
-						res.end(JSON.stringify({result: "error"}));
-					}
-				} else {
-					res.end(JSON.stringify({result: "error"}));
-				}
-				} else {
-					res.end(JSON.stringify({result: "error"}));
-				}
+
+            case 'payments':
+                const poolBlocks = Object.keys(this.portalStats.stats.pools).map(pool => ({
+                    name: pool,
+                    pending: this.portalStats.stats.pools[pool].pending,
+                    payments: this.portalStats.stats.pools[pool].payments
+                }));
+                this.sendJsonResponse(res, JSON.stringify(poolBlocks));
                 return;
+
+            case 'worker_stats':
+                await this.handleWorkerStats(req, res);
+                return;
+
             case 'live_stats':
-                res.writeHead(200, {
-                    'Content-Type': 'text/event-stream',
-                    'Cache-Control': 'no-cache',
-                    'Connection': 'keep-alive'
-                });
-                res.write('\n');
-                var uid = Math.random().toString();
-                _this.liveStatConnections[uid] = res;
-			res.flush();
-                req.on("close", function() {
-                    delete _this.liveStatConnections[uid];
-                });
+                this.handleLiveStats(req, res);
                 return;
+
             default:
                 next();
         }
-    };
+    }
 
-    this.handleAdminApiRequest = function(req, res, next){
-        switch(req.params.method){
-            case 'pools': {
-                res.end(JSON.stringify({result: poolConfigs}));
-                return;
+    async handleWorkerStats(req, res) {
+        const urlParams = req.url.split('?');
+        
+        if (urlParams.length <= 1) {
+            this.sendErrorResponse(res, 'Missing parameters');
+            return;
+        }
+
+        const address = urlParams[1]?.split('.')[0];
+        
+        if (!address) {
+            this.sendErrorResponse(res, 'Invalid address');
+            return;
+        }
+
+        try {
+            const [balances, shares] = await Promise.all([
+                this.getBalanceByAddress(address),
+                this.getTotalSharesByAddress(address)
+            ]);
+
+            const { history, workers, totalHash, networkSols } = this.processWorkerData(address, balances);
+
+            const response = {
+                miner: address,
+                totalHash,
+                totalShares: shares,
+                networkSols,
+                immature: balances.totalImmature,
+                balance: balances.totalHeld,
+                paid: balances.totalPaid,
+                workers,
+                history
+            };
+
+            this.sendJsonResponse(res, JSON.stringify(response));
+        } catch (error) {
+            this.sendErrorResponse(res, error);
+        }
+    }
+
+    processWorkerData(address, balances) {
+        const history = {};
+        const workers = {};
+        let totalHash = 0;
+        let networkSols = 0;
+
+        // Process historical data
+        for (const historyEntry of this.portalStats.statHistory) {
+            for (const [pool, poolData] of Object.entries(historyEntry.pools)) {
+                for (const [workerName, workerData] of Object.entries(poolData.workers)) {
+                    if (workerName.startsWith(address)) {
+                        if (!history[workerName]) {
+                            history[workerName] = [];
+                        }
+                        
+                        if (workerData.hashrate) {
+                            history[workerName].push({
+                                time: historyEntry.time,
+                                hashrate: workerData.hashrate
+                            });
+                        }
+                    }
+                }
             }
+        }
+
+        // Process current workers
+        for (const [pool, poolData] of Object.entries(this.portalStats.stats.pools)) {
+            for (const [workerName, workerData] of Object.entries(poolData.workers)) {
+                if (workerName.startsWith(address)) {
+                    workers[workerName] = { ...workerData };
+                    
+                    // Add balance information
+                    const workerBalance = balances.balances.find(b => b.worker === workerName);
+                    if (workerBalance) {
+                        workers[workerName].paid = workerBalance.paid;
+                        workers[workerName].balance = workerBalance.balance;
+                    }
+                    
+                    workers[workerName].balance = workers[workerName].balance || 0;
+                    workers[workerName].paid = workers[workerName].paid || 0;
+                    totalHash += poolData.workers[workerName].hashrate;
+                    networkSols = poolData.poolStats.networkSols;
+                }
+            }
+        }
+
+        return { history, workers, totalHash, networkSols };
+    }
+
+    handleLiveStats(req, res) {
+        res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Headers': 'Cache-Control'
+        });
+        
+        res.write('\n');
+        
+        const uid = Math.random().toString(36).substring(2, 15);
+        this.liveStatConnections.set(uid, res);
+        
+        if (res.flush) {
+            res.flush();
+        }
+
+        req.on('close', () => {
+            this.liveStatConnections.delete(uid);
+        });
+
+        req.on('error', () => {
+            this.liveStatConnections.delete(uid);
+        });
+    }
+
+    handleAdminApiRequest(req, res, next) {
+        const { method } = req.params;
+
+        switch (method) {
+            case 'pools':
+                this.sendJsonResponse(res, JSON.stringify({ result: this.poolConfigs }));
+                return;
+
             default:
                 next();
         }
-    };
+    }
 
-};
+    sendJsonResponse(res, data) {
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.end(data);
+    }
+
+    sendErrorResponse(res, error) {
+        this.sendJsonResponse(res, JSON.stringify({ 
+            result: 'error', 
+            message: error.message || error 
+        }));
+    }
+
+    // Promisify callback-based methods
+    getBlocksData() {
+        return new Promise((resolve, reject) => {
+            this.portalStats.getBlocks((data) => {
+                if (data) {
+                    resolve(data);
+                } else {
+                    reject(new Error('Failed to get blocks data'));
+                }
+            });
+        });
+    }
+
+    getBalanceByAddress(address) {
+        return new Promise((resolve, reject) => {
+            this.portalStats.getBalanceByAddress(address, (balances) => {
+                if (balances) {
+                    resolve(balances);
+                } else {
+                    reject(new Error('Failed to get balance data'));
+                }
+            });
+        });
+    }
+
+    getTotalSharesByAddress(address) {
+        return new Promise((resolve, reject) => {
+            this.portalStats.getTotalSharesByAddress(address, (shares) => {
+                resolve(shares);
+            });
+        });
+    }
+
+    broadcastLiveStats(data) {
+        const message = `data: ${JSON.stringify(data)}\n\n`;
+        
+        for (const [uid, res] of this.liveStatConnections) {
+            try {
+                res.write(message);
+                if (res.flush) {
+                    res.flush();
+                }
+            } catch (error) {
+                this.liveStatConnections.delete(uid);
+            }
+        }
+    }
+
+    close() {
+        for (const [uid, res] of this.liveStatConnections) {
+            try {
+                res.end();
+            } catch (error) {
+                // Connection already closed
+            }
+        }
+        this.liveStatConnections.clear();
+    }
+}

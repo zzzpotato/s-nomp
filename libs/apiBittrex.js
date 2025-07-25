@@ -1,222 +1,202 @@
-var request = require('request');
-var nonce   = require('nonce');
+import crypto from 'crypto';
+import { fetch } from 'undici';
 
-module.exports = function() {
-    'use strict';
+export default class BittrexAPI {
+    constructor(key, secret) {
+        this.key = key;
+        this.secret = secret;
+        this.version = '0.1.0';
+        this.PUBLIC_API_URL = 'https://api.bittrex.com/v3';
+        this.PRIVATE_API_URL = 'https://api.bittrex.com/v3';
+        this.USER_AGENT = 'nomp/node-open-mining-portal';
+        this.STRICT_SSL = true;
+        this.requestCount = 0;
+    }
 
-    // Module dependencies
+    _getPrivateHeaders(uri, body = '') {
+        if (!this.key || !this.secret) {
+            throw new Error('Bittrex: API key and secret required for private endpoints');
+        }
 
-    // Constants
-    var version         = '0.1.0',
-        PUBLIC_API_URL  = 'https://bittrex.com/api/v1/public',
-        PRIVATE_API_URL = 'https://bittrex.com/api/v1/market',
-        USER_AGENT      = 'nomp/node-open-mining-portal'
+        const timestamp = Date.now().toString();
+        const contentHash = crypto.createHash('sha512').update(body).digest('hex');
+        const preSign = [timestamp, uri, 'GET', contentHash].join('');
+        const signature = crypto.createHmac('sha512', this.secret).update(preSign).digest('hex');
 
-    // Constructor
-    function Bittrex(key, secret){
-        // Generate headers signed by this user's key and secret.
-        // The secret is encapsulated and never exposed
-        this._getPrivateHeaders = function(parameters){
-            var paramString, signature;
-
-            if (!key || !secret){
-                throw 'Bittrex: Error. API key and secret required';
-            }
-
-            // Sort parameters alphabetically and convert to `arg1=foo&arg2=bar`
-            paramString = Object.keys(parameters).sort().map(function(param){
-                return encodeURIComponent(param) + '=' + encodeURIComponent(parameters[param]);
-            }).join('&');
-
-            signature = crypto.createHmac('sha512', secret).update(paramString).digest('hex');
-
-            return {
-                Key: key,
-                Sign: signature
-            };
+        return {
+            'Api-Key': this.key,
+            'Api-Timestamp': timestamp,
+            'Api-Content-Hash': contentHash,
+            'Api-Signature': signature,
+            'Content-Type': 'application/json',
+            'User-Agent': this.USER_AGENT
         };
     }
 
-    // If a site uses non-trusted SSL certificates, set this value to false
-    Bittrex.STRICT_SSL = true;
+    async _request(method, endpoint, params = {}, isPrivate = false) {
+        const url = new URL(endpoint, isPrivate ? this.PRIVATE_API_URL : this.PUBLIC_API_URL);
+        
+        if (method === 'GET' && Object.keys(params).length > 0) {
+            Object.entries(params).forEach(([key, value]) => {
+                if (value !== undefined && value !== null) {
+                    url.searchParams.append(key, value.toString());
+                }
+            });
+        }
 
-    // Helper methods
-    function joinCurrencies(currencyA, currencyB){
-        return currencyA + '-' + currencyB;
+        const options = {
+            method,
+            headers: {
+                'User-Agent': this.USER_AGENT,
+                'Content-Type': 'application/json'
+            }
+        };
+
+        if (isPrivate) {
+            const body = method !== 'GET' ? JSON.stringify(params) : '';
+            options.headers = { ...options.headers, ...this._getPrivateHeaders(url.toString(), body) };
+            if (method !== 'GET') {
+                options.body = body;
+            }
+        }
+
+        try {
+            this.requestCount++;
+            const response = await fetch(url.toString(), options);
+            
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            }
+
+            const data = await response.json();
+            return data;
+        } catch (error) {
+            throw new Error(`Bittrex API request failed: ${error.message}`);
+        }
     }
 
-    // Prototype
-    Bittrex.prototype = {
-        constructor: Bittrex,
+    // Helper method to join currencies in Bittrex format
+    joinCurrencies(currencyA, currencyB) {
+        return `${currencyA}-${currencyB}`;
+    }
 
-        // Make an API request
-        _request: function(options, callback){
-            if (!('headers' in options)){
-                options.headers = {};
-            }
+    // PUBLIC METHODS
 
-            options.headers['User-Agent'] = USER_AGENT;
-            options.json = true;
-            options.strictSSL = Bittrex.STRICT_SSL;
+    async getMarkets() {
+        return this._request('GET', '/markets');
+    }
 
-            request(options, function(err, response, body) {
-                callback(err, body);
-            });
+    async getTicker(market = null) {
+        const endpoint = market ? `/markets/${market}/ticker` : '/markets/tickers';
+        return this._request('GET', endpoint);
+    }
 
-            return this;
-        },
+    async getMarketSummary(market = null) {
+        const endpoint = market ? `/markets/${market}/summary` : '/markets/summaries';
+        return this._request('GET', endpoint);
+    }
 
-        // Make a public API request
-        _public: function(parameters, callback){
-            var options = {
-                method: 'GET',
-                url: PUBLIC_API_URL,
-                qs: parameters
-            };
+    async getOrderBook(market, depth = 25) {
+        const params = { depth };
+        return this._request('GET', `/markets/${market}/orderbook`, params);
+    }
 
-            return this._request(options, callback);
-        },
+    async getTradeHistory(market) {
+        return this._request('GET', `/markets/${market}/trades`);
+    }
 
-        // Make a private API request
-        _private: function(parameters, callback){
-            var options;
+    async getCandles(market, candleInterval, options = {}) {
+        const params = { candleInterval, ...options };
+        return this._request('GET', `/markets/${market}/candles`, params);
+    }
 
-            parameters.nonce = nonce();
-            options = {
-                method: 'POST',
-                url: PRIVATE_API_URL,
-                form: parameters,
-                headers: this._getPrivateHeaders(parameters)
-            };
+    // PRIVATE METHODS
 
-            return this._request(options, callback);
-        },
+    async getBalances() {
+        return this._request('GET', '/balances', {}, true);
+    }
 
+    async getBalance(currency) {
+        return this._request('GET', `/balances/${currency}`, {}, true);
+    }
 
-        /////
+    async getOrders(options = {}) {
+        return this._request('GET', '/orders/open', options, true);
+    }
 
+    async getOrderHistory(options = {}) {
+        return this._request('GET', '/orders/closed', options, true);
+    }
 
-        // PUBLIC METHODS
+    async getOrder(orderId) {
+        return this._request('GET', `/orders/${orderId}`, {}, true);
+    }
 
-        getTicker: function(callback){
-            var options = {
-                method: 'GET',
-                url: PUBLIC_API_URL + '/getmarketsummaries',
-                qs: null
-            };
+    async cancelOrder(orderId) {
+        return this._request('DELETE', `/orders/${orderId}`, {}, true);
+    }
 
-            return this._request(options, callback);
-        },
+    async placeBuyOrder(market, quantity, rate, timeInForce = 'GOOD_TILL_CANCELLED', orderType = 'LIMIT') {
+        const params = {
+            marketSymbol: market,
+            direction: 'BUY',
+            type: orderType,
+            quantity: quantity.toString(),
+            limit: rate.toString(),
+            timeInForce
+        };
+        return this._request('POST', '/orders', params, true);
+    }
 
-        // getBuyOrderBook: function(currencyA, currencyB, callback){
-        //     var options = {
-        //         method: 'GET',
-        //         url: PUBLIC_API_URL + '/orders/' + currencyB + '/' + currencyA + '/BUY',
-        //         qs: null
-        //     };
+    async placeSellOrder(market, quantity, rate, timeInForce = 'GOOD_TILL_CANCELLED', orderType = 'LIMIT') {
+        const params = {
+            marketSymbol: market,
+            direction: 'SELL',
+            type: orderType,
+            quantity: quantity.toString(),
+            limit: rate.toString(),
+            timeInForce
+        };
+        return this._request('POST', '/orders', params, true);
+    }
 
-        //     return this._request(options, callback);
-        // },
-
-        getOrderBook: function(currencyA, currencyB, callback){
-            var parameters = {
-                market: joinCurrencies(currencyA, currencyB),
-                type: 'buy',
-                depth: '50'
-            }
-            var options = {
-                method: 'GET',
-                url: PUBLIC_API_URL + '/getorderbook',
-                qs: parameters
-            }
-
-            return this._request(options, callback);
-        },
-
-        getTradeHistory: function(currencyA, currencyB, callback){
-            var parameters = {
-                    command: 'returnTradeHistory',
-                    currencyPair: joinCurrencies(currencyA, currencyB)
-                };
-
-            return this._public(parameters, callback);
-        },
-
-
-        /////
-
-
-        // PRIVATE METHODS
-
-        myBalances: function(callback){
-            var parameters = {
-                    command: 'returnBalances'
-                };
-
-            return this._private(parameters, callback);
-        },
-
-        myOpenOrders: function(currencyA, currencyB, callback){
-            var parameters = {
-                    command: 'returnOpenOrders',
-                    currencyPair: joinCurrencies(currencyA, currencyB)
-                };
-
-            return this._private(parameters, callback);
-        },
-
-        myTradeHistory: function(currencyA, currencyB, callback){
-            var parameters = {
-                    command: 'returnTradeHistory',
-                    currencyPair: joinCurrencies(currencyA, currencyB)
-                };
-
-            return this._private(parameters, callback);
-        },
-
-        buy: function(currencyA, currencyB, rate, amount, callback){
-            var parameters = {
-                    command: 'buy',
-                    currencyPair: joinCurrencies(currencyA, currencyB),
-                    rate: rate,
-                    amount: amount
-                };
-
-            return this._private(parameters, callback);
-        },
-
-        sell: function(currencyA, currencyB, rate, amount, callback){
-            var parameters = {
-                    command: 'sell',
-                    currencyPair: joinCurrencies(currencyA, currencyB),
-                    rate: rate,
-                    amount: amount
-                };
-
-            return this._private(parameters, callback);
-        },
-
-        cancelOrder: function(currencyA, currencyB, orderNumber, callback){
-            var parameters = {
-                    command: 'cancelOrder',
-                    currencyPair: joinCurrencies(currencyA, currencyB),
-                    orderNumber: orderNumber
-                };
-
-            return this._private(parameters, callback);
-        },
-
-        withdraw: function(currency, amount, address, callback){
-            var parameters = {
-                    command: 'withdraw',
-                    currency: currency,
-                    amount: amount,
-                    address: address
-                };
-
-            return this._private(parameters, callback);
+    async withdraw(currency, quantity, address, addressTag = null) {
+        const params = {
+            currencySymbol: currency,
+            quantity: quantity.toString(),
+            cryptoAddress: address
+        };
+        
+        if (addressTag) {
+            params.cryptoAddressTag = addressTag;
         }
-    };
 
-    return Bittrex;
-}();
+        return this._request('POST', '/withdrawals', params, true);
+    }
+
+    async getDepositAddress(currency) {
+        return this._request('GET', `/addresses/${currency}`, {}, true);
+    }
+
+    async getDepositHistory(options = {}) {
+        return this._request('GET', '/deposits/open', options, true);
+    }
+
+    async getWithdrawalHistory(options = {}) {
+        return this._request('GET', '/withdrawals/open', options, true);
+    }
+
+    // Utility methods
+    getRequestCount() {
+        return this.requestCount;
+    }
+
+    resetRequestCount() {
+        this.requestCount = 0;
+    }
+
+    // Rate limiting helper
+    async waitForRateLimit(delayMs = 1000) {
+        return new Promise(resolve => setTimeout(resolve, delayMs));
+    }
+}

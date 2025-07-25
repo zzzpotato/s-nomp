@@ -1,89 +1,85 @@
-var dateFormat = require('dateformat');
-var colors = require('colors');
+import dateFormat from 'dateformat';
+import colors from 'colors';
 
-
-var severityToColor = function(severity, text) {
-    switch(severity) {
+const severityToColor = (severity, text) => {
+    switch(severity){
         case 'special':
-            return text.cyan.underline;
+            return colors.cyan(text);
         case 'debug':
-            return text.green;
+            return colors.green(text);
         case 'warning':
-            return text.yellow;
+            return colors.yellow(text);
         case 'error':
-            return text.red;
+            return colors.red(text);
         default:
-            console.log("Unknown severity " + severity);
-            return text.italic;
+            return colors.white(text);
     }
 };
 
-var severityValues = {
-    'debug': 1,
-    'warning': 2,
-    'error': 3,
-    'special': 4
-};
+export default class PoolLogger {
+    constructor(configuration) {
+        this.logLevel = configuration.logLevel;
+        this.logColors = configuration.logColors;
+        
+        this.logLevelInt = (() => {
+            switch(configuration.logLevel) {
+                case 'debug':
+                    return 0;
+                case 'warning':
+                    return 1;
+                case 'error':
+                    return 2;
+                default:
+                    return 0;
+            }
+        })();
+    }
 
+    log(severity, system, component, text, subcat) {
+        if (this.logLevelInt > this.severityToInt(severity)) return;
 
-var PoolLogger = function (configuration) {
-
-
-    var logLevelInt = severityValues[configuration.logLevel];
-    var logColors = configuration.logColors;
-
-
-
-    var log = function(severity, system, component, text, subcat) {
-
-        if (severityValues[severity] < logLevelInt) return;
-
+        const entryDesc = `${dateFormat(new Date(), 'yyyy-mm-dd HH:MM:ss')} [${system}]\t`;
+        let logString;
+        
         if (subcat){
-            var realText = subcat;
-            var realSubCat = text;
-            text = realText;
-            subcat = realSubCat;
+            logString = `${entryDesc}(${component}) [${subcat}]\t${text}`;
+        } else {
+            logString = `${entryDesc}(${component})\t\t${text}`;
         }
 
-        var entryDesc = dateFormat(new Date(), 'yyyy-mm-dd HH:MM:ss') + ' [' + system + ']\t';
-        if (logColors) {
-            entryDesc = severityToColor(severity, entryDesc);
-
-            var logString =
-                    entryDesc +
-                    ('[' + component + '] ').italic;
-
-            if (subcat)
-                logString += ('(' + subcat + ') ').bold.grey;
-
-            logString += text.grey;
-        }
-        else {
-            var logString =
-                    entryDesc +
-                    '[' + component + '] ';
-
-            if (subcat)
-                logString += '(' + subcat + ') ';
-
-            logString += text;
+        if (this.logColors){
+            logString = severityToColor(severity, logString);
         }
 
         console.log(logString);
+    }
 
+    severityToInt(severity) {
+        switch(severity) {
+            case 'debug':
+                return 0;
+            case 'warning':
+                return 1;
+            case 'error':
+                return 2;
+            default:
+                return 0;
+        }
+    }
 
-    };
+    debug(system, component, text, subcat) {
+        this.log('debug', system, component, text, subcat);
+    }
 
-    // public
+    warning(system, component, text, subcat) {
+        this.log('warning', system, component, text, subcat);
+    }
 
-    var _this = this;
-    Object.keys(severityValues).forEach(function(logType){
-        _this[logType] = function(){
-            var args = Array.prototype.slice.call(arguments, 0);
-            args.unshift(logType);
-            log.apply(this, args);
-        };
-    });
-};
+    error(system, component, text, subcat) {
+        this.log('error', system, component, text, subcat);
+    }
 
-module.exports = PoolLogger;
+    special(system, component, text, subcat) {
+        this.log('special', system, component, text, subcat);
+    }
+}
